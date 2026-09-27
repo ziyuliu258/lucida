@@ -1,0 +1,41 @@
+model:
+  name_or_path: Qwen/Qwen3-VL-2B-Instruct
+  dtype: bfloat16
+  freeze_vision_encoder: true
+  gradient_checkpointing: true
+  # Bound each observation to 512x512-equivalent visual tokens. Long
+  # trajectories include their full image/action history.
+  vision_max_pixels: 262144
+  vision_min_pixels: 65536
+
+lora:
+  rank: 16
+  alpha: 32
+  dropout: 0.0
+  # Keep the pretrained vision backbone frozen, but train low-rank adapters in
+  # its attention and MLP projections so the fixed visual states can be bound
+  # to their distinct GizmoAct trajectories.
+  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj, qkv, proj, linear_fc1, linear_fc2]
+
+training:
+  seed: 20260922
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 1
+  learning_rate: 0.0001
+  weight_decay: 0.0
+  max_steps: 2000
+  warmup_ratio: 0.03
+  logging_steps: 1
+  save_steps: 500
+  eval_steps: 100
+  max_sequence_length: 8192
+  bf16: true
+  # Dataset-wide teacher-forced and closed-loop evaluators decide convergence.
+  # Do not stop on a streak of randomly sampled per-turn losses.
+  overfit_loss_threshold: -1.0
+  overfit_loss_patience: 0
+
+distributed:
+  backend: nccl
+  launcher: torchrun
+  deepspeed_config: configs/zero3.json

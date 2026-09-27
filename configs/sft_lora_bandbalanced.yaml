@@ -1,0 +1,60 @@
+model:
+  name_or_path: Qwen/Qwen3-VL-2B-Instruct
+  dtype: bfloat16
+  freeze_vision_encoder: true
+  gradient_checkpointing: true
+  # Match the best action-weighted checkpoint's visual-token budget.  The
+  # 4-GPU launch is supplied externally; no world-size is baked into data.
+  vision_max_pixels: 262144
+  vision_min_pixels: 65536
+
+lora:
+  rank: 16
+  alpha: 32
+  dropout: 0.0
+  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj, qkv, proj, linear_fc1, linear_fc2]
+
+# This is a static reweighting of the frozen 207 supervised turns.  Half of
+# the loss remains ordinary per-turn SFT; the other half is uniform across the
+# complete GizmoAct strings whose corpus frequency is 4--19.  In overfit50
+# that band contains the two 10-count, one 6-count, and nine 5-count actions.
+# It deliberately excludes the 39 singleton actions so they cannot dominate
+# the objective, while the empirical half retains all common and tail actions.
+action_weighting:
+  enabled: true
+  example_weight_mode: empirical_plus_uniform_action_band
+  empirical_mass: 0.50
+  uniform_action_band_mass: 0.50
+  action_band_min_frequency: 4
+  action_band_max_frequency: 19
+  syntax_token_weight: 1.0
+  opening_tag_weight: 2.0
+  payload_value_weight: 4.0
+  normalize_token_weights_per_turn: true
+  # The analytic mixture has mean example weight exactly one.  Do not
+  # renormalize it, so the stated empirical/uniform masses stay explicit.
+  normalize_example_weights: false
+
+training:
+  seed: 20260922
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 1
+  # With four DDP ranks, 500 optimizer steps consume 2,000 sample updates.
+  # Initialize externally from actionweighted/checkpoint-800 with a fresh
+  # optimizer and scheduler.
+  learning_rate: 0.00001
+  weight_decay: 0.0
+  max_steps: 500
+  warmup_ratio: 0.02
+  logging_steps: 1
+  save_steps: 100
+  eval_steps: 100
+  max_sequence_length: 8192
+  bf16: true
+  overfit_loss_threshold: -1.0
+  overfit_loss_patience: 0
+
+distributed:
+  backend: nccl
+  launcher: torchrun
+  deepspeed_config: configs/zero3.json

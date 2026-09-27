@@ -1,0 +1,45 @@
+# Python bytecode, test and build output
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage*
+htmlcov/
+build/
+dist/
+
+# Local virtual environments and dependency snapshots
+/env/
+/env-*/
+/.venv/
+/venv/
+/environment/
+
+# Local caches, credentials and editor/OS files
+.cache/
+.env
+.env.*
+!.env.example
+.DS_Store
+*.swp
+*.swo
+
+# Downloaded datasets, generated manifests/observations and vendored source
+/data/*
+!/data/README.md
+/third_party/
+
+# Pretrained weights and generated training/evaluation artifacts
+/models/*
+!/models/README.md
+/outputs/
+
+# The source paper is kept locally; redistribute only after checking its terms
+/docs/lucida.pdf
+
+# Logs and common model/checkpoint archives
+*.log
+*.ckpt
+*.safetensors

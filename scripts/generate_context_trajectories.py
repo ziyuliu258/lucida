@@ -23,11 +23,22 @@ def record_to_pose(record) -> Pose:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("dataset_root", type=Path)
+    parser.add_argument("dataset_root", type=Path, help="source root containing contexts/<id>")
     parser.add_argument("context_id")
+    parser.add_argument("--output-root", type=Path, required=True, help="new versioned dataset root")
     parser.add_argument("--seed", type=int, default=20260922)
     args = parser.parse_args()
-    context_dir = args.dataset_root / "contexts" / args.context_id
+    source_root = args.dataset_root.resolve()
+    output_root = args.output_root.resolve()
+    if output_root == source_root:
+        raise ValueError("trajectory output must use a new dataset root; source data is immutable")
+    output_root.mkdir(parents=True, exist_ok=True)
+    contexts_link = output_root / "contexts"
+    if not contexts_link.exists():
+        contexts_link.symlink_to(source_root / "contexts", target_is_directory=True)
+    elif not contexts_link.is_symlink() or contexts_link.resolve() != (source_root / "contexts").resolve():
+        raise FileExistsError(f"output contexts path is not the expected immutable source link: {contexts_link}")
+    context_dir = source_root / "contexts" / args.context_id
     context = json.loads((context_dir / "context.json").read_text())
     target = context["target_pose"]
     target_pose = Pose(
@@ -44,6 +55,7 @@ def main() -> None:
         raise NotImplementedError(f"no renderer for source {context['source']}")
 
     trajectories = []
+    frame_count = len(context.get("views", context.get("rgb_paths", ["rgb.png"])))
     for index in range(10):
         relative_dir = Path("trajectories") / args.context_id / f"{index:02d}"
         trajectory = generate_expert_trajectory(
@@ -54,16 +66,26 @@ def main() -> None:
             observation_dir=relative_dir,
             thresholds=ExpertThresholds(),
             config=PerturbationConfig(),
+            observation_frame_count=frame_count,
         )
-        actual_dir = args.dataset_root / relative_dir
-        actual_dir.mkdir(parents=True, exist_ok=True)
+        actual_dir = output_root / relative_dir
+        if actual_dir.exists():
+            raise FileExistsError(f"refusing to overwrite trajectory output: {actual_dir}")
+        actual_dir.mkdir(parents=True)
         for turn in trajectory.turns:
-            render(
+            rendered = render(
                 context_dir,
                 record_to_pose(turn.state_before),
-                args.dataset_root / turn.observation_paths[0],
+                output_root / turn.observation_paths[0],
                 mode=turn.observation_mode_before,
+                frame_index=turn.observation_frame_index or 0,
             )
+            expected = [output_root / path for path in turn.observation_paths]
+            if [path.resolve() for path in rendered] != [path.resolve() for path in expected]:
+                raise RuntimeError(
+                    f"renderer outputs do not match trajectory paths for "
+                    f"{trajectory.trajectory_id} step {turn.step}"
+                )
         (actual_dir / "trajectory.json").write_text(trajectory.model_dump_json(indent=2))
         trajectories.append(trajectory)
         print(trajectory.trajectory_id, len(trajectory.turns), trajectory.termination)

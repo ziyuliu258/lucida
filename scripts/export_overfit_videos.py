@@ -84,6 +84,14 @@ def paste_fit(canvas, path, box):
 def observation_paths(directory, index):
     stem = f'step_{index:02d}'
     single = directory / (stem + '.png')
+    separate = [single, directory / f'{stem}_overlay.png', directory / f'{stem}_pointcloud.png']
+    orthographic = [
+        directory / f'{stem}_local_{axis}_{sign}.png'
+        for axis in ('x', 'y', 'z')
+        for sign in ('pos', 'neg')
+    ]
+    if all(path.exists() for path in separate):
+        return separate + (orthographic if all(path.exists() for path in orthographic) else [])
     if single.exists():
         return [single]
     paths = [directory / f'{stem}_{suffix}.png' for suffix in ['reference', 'current', 'focus']]
@@ -105,13 +113,17 @@ def draw_frame(tid, context, index, records, metrics, obs, mode, checkpoint, pre
     d.rounded_rectangle((20, 111, 1042, 964), 14, fill=PANEL)
     view_title = 'FINAL SOURCE SCENE / POSE UNCHANGED' if presentation_final_scene else 'SAVED MODEL OBSERVATION  /  ' + mode.upper().replace('_', ' ')
     d.text((36, 123), view_title, font=font(20, True), fill=GREEN if presentation_final_scene else MUTED)
-    if len(obs) == 3:
-        # Retain the complete native reference/current frames and the exact focus image.
-        paste_fit(canvas, obs[0], (32, 166, 492, 397))
-        paste_fit(canvas, obs[1], (538, 166, 492, 397))
-        d.text((44, 582), 'REFERENCE CROP', font=font(19, True), fill=MUTED)
-        d.text((540, 582), 'CURRENT MESH CROP', font=font(19, True), fill=MUTED)
-        paste_fit(canvas, obs[2], (40, 617, 982, 329))
+    if len(obs) >= 3:
+        labels = ('RAW RGB', 'MATERIAL OVERLAY', 'RGB-COLORED POINT CLOUD')
+        for index, (path, label) in enumerate(zip(obs[:3], labels)):
+            x = 32 + index * 330
+            d.text((x + 8, 150), label, font=font(15, True), fill=MUTED)
+            paste_fit(canvas, path, (x, 174, 320, 420))
+        if len(obs) >= 9:
+            for index, path in enumerate(obs[3:9]):
+                x = 32 + (index % 3) * 330
+                y = 610 + (index // 3) * 170
+                paste_fit(canvas, path, (x, y, 320, 160))
     else:
         paste_fit(canvas, obs[0], (34, 165, 994, 782))
     d.rounded_rectangle((1062, 111, 1580, 383), 14, fill=PANEL)
@@ -287,7 +299,7 @@ def main():
                 use_source_material=True,
             )
             final_paths = []
-            suffixes = ['reference', 'current', 'focus'] if len(rendered) == 3 else ['scene_views']
+            suffixes = ['raw', 'overlay', 'pointcloud'] if len(rendered) == 3 else [f'view_{i:02d}' for i in range(len(rendered))]
             for source_path, suffix in zip(rendered, suffixes):
                 final_path = case_dir / 'observations' / f'final_scene_{suffix}.png'
                 if source_path.resolve() != final_path.resolve():

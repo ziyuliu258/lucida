@@ -37,10 +37,16 @@ def main() -> None:
     parser.add_argument("output", type=Path)
     parser.add_argument("--target-id", default=DEFAULT_TARGET_ID)
     parser.add_argument("--timestamps", nargs=4, default=DEFAULT_TIMESTAMPS)
+    parser.add_argument("--split", choices=("train", "validation", "test"), required=True)
     parser.add_argument("--point-stride", type=int, default=2)
     args = parser.parse_args()
 
-    args.output.mkdir(parents=True, exist_ok=True)
+    if args.point_stride < 1:
+        raise ValueError("--point-stride must be at least 1")
+    if len(set(args.timestamps)) != len(args.timestamps):
+        raise ValueError("--timestamps must name four distinct source frames")
+
+    args.output.mkdir(parents=True, exist_ok=False)
     world_instances = load_json(args.capture_root / "world.gt/instances.json")
     target = next(item for item in world_instances if item["id"] == args.target_id)
     (args.output / "source_instance.json").write_text(json.dumps(target, indent=2))
@@ -92,6 +98,7 @@ def main() -> None:
                 "target_mask_path": mask_name,
                 "depth_path": depth_name,
                 "target_bbox_xyxy": bbox,
+                "resolution_wh": [rgb.width, rgb.height],
                 "rgb_intrinsic": load_json(wide_dir / "image/K.json"),
                 "depth_intrinsic": intrinsic.tolist(),
                 "camera_to_world": camera_to_world.tolist(),
@@ -103,6 +110,7 @@ def main() -> None:
     context = {
         "context_id": "ca1m_01",
         "source": "ca1m_objects",
+        "source_split": args.split,
         "source_capture": args.capture_root.name,
         "target_id": args.target_id,
         "target_category": target["category"],
@@ -114,6 +122,7 @@ def main() -> None:
         },
         "views": view_records,
         "point_cloud_path": "point_cloud_world_m.npy",
+        "point_cloud_stride": args.point_stride,
         "coordinate_convention": "CA-1M laser-scanner world; camera_to_world from gt/RT.json",
         "units": "meters",
         "asset_status": "SAM 3D mesh and manual alignment pending",

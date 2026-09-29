@@ -25,6 +25,15 @@ def main() -> None:
         raw["mesh_path"] = str(prefix / raw["mesh_path"])
         raw["camera_path"] = str(prefix / raw["camera_path"])
         raw["point_cloud_path"] = str(prefix / raw["point_cloud_path"])
+        raw["point_cloud_paths_by_view"] = [
+            str(prefix / item) for item in raw.get("point_cloud_paths_by_view", [])
+        ]
+        if raw.get("scene_geometry_path"):
+            raw["scene_geometry_path"] = str(prefix / raw["scene_geometry_path"])
+        if raw.get("layout_path"):
+            raw["layout_path"] = str(prefix / raw["layout_path"])
+        if raw.get("alignment_path"):
+            raw["alignment_path"] = str(prefix / raw["alignment_path"])
         raw["rgb_paths"] = [str(prefix / item) for item in raw["rgb_paths"]]
         raw["depth_paths"] = [str(prefix / item) for item in raw.get("depth_paths", [])]
         contexts.append(ContextRecord.model_validate(raw))
@@ -37,7 +46,10 @@ def main() -> None:
         name="gizmoact_overfit50", frozen=args.freeze,
         contexts=contexts, trajectories=trajectories,
     )
+    manifest.validate_corrected_inputs(args.dataset_root)
     output = args.dataset_root / "manifest.json"
+    if output.exists():
+        raise FileExistsError(f"refusing to replace an existing manifest: {output}")
     output.write_text(manifest.model_dump_json(indent=2))
     print(json.dumps({"output": str(output), "frozen": args.freeze, "contexts": 5, "trajectories": 50}))
 

@@ -34,16 +34,46 @@ def prepare(scene_root: Path, models_root: Path, output_root: Path, context_id: 
     segmentation_path = find_one(product, "instance_segmentation/*.png")
     bbox_path = find_one(product, "bounding_box_2d_tight/*.npy")
 
-    mesh = trimesh.load(models_root / object_name / "meshes/model.obj", force="mesh", process=False)
-    vertices = np.asarray(mesh.vertices, dtype=np.float64)
+    loaded_mesh = trimesh.load(
+        models_root / object_name / "meshes/model.obj", force="scene", process=False
+    )
+    if isinstance(loaded_mesh, trimesh.Scene):
+        mesh_instances = []
+        world_vertices = []
+        for node in loaded_mesh.graph.nodes_geometry:
+            transform, geometry_name = loaded_mesh.graph.get(node)
+            geometry = loaded_mesh.geometry[geometry_name].copy()
+            transform = np.asarray(transform, dtype=np.float64)
+            mesh_instances.append((str(node), geometry, transform))
+            homogeneous = np.column_stack((geometry.vertices, np.ones(len(geometry.vertices))))
+            world_vertices.append((transform @ homogeneous.T).T[:, :3])
+    else:
+        mesh_instances = [("asset", loaded_mesh.copy(), np.eye(4, dtype=np.float64))]
+        world_vertices = [np.asarray(loaded_mesh.vertices, dtype=np.float64)]
+    if not mesh_instances:
+        raise ValueError(f"FoundationPose asset has no geometry: {object_name}")
+    vertices = np.concatenate(world_vertices, axis=0)
     lower, upper = vertices.min(axis=0), vertices.max(axis=0)
     center = (lower + upper) / 2.0
     centered = vertices - center
     radius = float(np.linalg.norm(centered, axis=1).max())
     extents = upper - lower
-    # Store a per-axis unit box canonical mesh. Combined with target size below,
-    # this is identical to FoundationPose's centered unit-sphere normalization.
-    mesh.vertices = centered / extents
+    if radius <= 1e-9 or np.any(extents <= 1e-9):
+        raise ValueError(f"FoundationPose asset has a degenerate bounding box: {object_name}")
+    # Store the mesh in object-local coordinates while retaining every source
+    # material and node transform. The released size still follows the
+    # centered unit-sphere normalization used by FoundationPose.
+    normalize = np.eye(4, dtype=np.float64)
+    normalize[:3, :3] = np.diag(1.0 / extents)
+    normalize[:3, 3] = -center / extents
+    mesh_scene = trimesh.Scene()
+    for index, (node, geometry, transform) in enumerate(mesh_instances):
+        mesh_scene.add_geometry(
+            geometry,
+            geom_name=f"foundationpose_geometry_{index:03d}",
+            node_name=f"foundationpose_{node}_{index:03d}",
+            transform=normalize @ transform,
+        )
 
     scaled_rotation = np.asarray(state["rotation_matrix"], dtype=np.float64)
     scene_scale = np.linalg.norm(scaled_rotation, axis=0)
@@ -56,8 +86,10 @@ def prepare(scene_root: Path, models_root: Path, output_root: Path, context_id: 
     position = np.asarray(state["translation"], dtype=np.float64)
 
     output = output_root / context_id
+    if output.exists():
+        raise FileExistsError(f"refusing to overwrite context output: {output}")
     output.mkdir(parents=True, exist_ok=True)
-    mesh.export(output / "mesh.glb")
+    mesh_scene.export(output / "mesh.glb")
     shutil.copy2(rgb_path, output / "rgb.png")
     np.save(output / "depth_m.npy", np.load(depth_path))
 

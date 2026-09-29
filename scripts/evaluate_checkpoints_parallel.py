@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 import subprocess
@@ -16,11 +17,11 @@ from lucida_mini.evaluation import rollout_protocol
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
-def current_closed_protocol(directory: Path) -> bool:
+def current_closed_protocol(directory: Path, max_steps: int) -> bool:
     path = directory / "closed_loop.json"
     if not path.is_file():
         return False
-    return json.loads(path.read_text()).get("protocol") == rollout_protocol()
+    return json.loads(path.read_text()).get("protocol") == rollout_protocol(max_steps)
 
 
 def gpu_free_memory() -> dict[int, int]:
@@ -47,10 +48,36 @@ def run_kind(
     args: argparse.Namespace,
 ) -> None:
     root = args.run_dir / f"{kind}-{step}"
+    signature = {
+        "manifest_sha256": hashlib.sha256(args.manifest.read_bytes()).hexdigest(),
+        "base_model": str(args.base_model),
+        "step": step,
+        "prompt_version": "target-cue-v1",
+        "render_version": "separate-native-views-sequential-ca1m-v1",
+        "vision_max_pixels": args.vision_max_pixels,
+        "vision_min_pixels": args.vision_min_pixels,
+        "max_sequence_length": args.max_sequence_length,
+        "max_steps": args.max_steps,
+    }
+    signature_path = root / "evaluation_input_signature.json"
+    if root.exists():
+        previous = json.loads(signature_path.read_text()) if signature_path.is_file() else None
+        if previous != signature:
+            stale = root.with_name(f"{root.name}.previous")
+            suffix = 1
+            while stale.exists():
+                stale = root.with_name(f"{root.name}.previous_{suffix}")
+                suffix += 1
+            root.rename(stale)
     root.mkdir(parents=True, exist_ok=True)
+    signature_path.write_text(json.dumps(signature, indent=2) + "\n")
     merged_rows = root / ("per_turn.csv" if kind == "teacher-forced" else "per_trajectory.csv")
     summary = root / "summary.csv"
-    expected_rows = 207 if kind == "teacher-forced" else 50
+    trajectories = json.loads(args.manifest.read_text())["trajectories"]
+    expected_rows = (
+        sum(bool(turn["supervise"]) for item in trajectories for turn in item["turns"])
+        if kind == "teacher-forced" else len(trajectories)
+    )
     if merged_rows.is_file() and summary.is_file():
         with merged_rows.open(newline="") as handle:
             existing_count = sum(1 for _ in csv.DictReader(handle))
@@ -58,7 +85,7 @@ def run_kind(
             summary_rows = list(csv.DictReader(handle))
         if (
             existing_count == expected_rows and len(summary_rows) == 1
-            and (kind == "teacher-forced" or current_closed_protocol(root))
+            and (kind == "teacher-forced" or current_closed_protocol(root, args.max_steps))
         ):
             print(f"step={step} {kind} already complete; reusing {existing_count} fixed cases", flush=True)
             return
@@ -70,7 +97,6 @@ def run_kind(
     )
     worker_outputs = [root / f"shard_{index:02d}" for index in range(len(devices))]
     processes: list[tuple[subprocess.Popen, object, Path]] = []
-    trajectories = json.loads(args.manifest.read_text())["trajectories"]
     for index, (physical_device, output_dir) in enumerate(zip(devices, worker_outputs)):
         output_dir.mkdir(parents=True, exist_ok=True)
         shard_data = output_dir / ("per_turn.csv" if kind == "teacher-forced" else "per_trajectory.csv")
@@ -90,7 +116,7 @@ def run_kind(
                 for row in csv.DictReader(handle):
                     trajectory_id = row["trajectory_id"]
                     actual[trajectory_id] = actual.get(trajectory_id, 0) + 1
-        if actual == expected and (kind == "teacher-forced" or current_closed_protocol(output_dir)):
+        if actual == expected and (kind == "teacher-forced" or current_closed_protocol(output_dir, args.max_steps)):
             print(f"step={step} {kind} shard {index} already complete; reusing", flush=True)
             continue
         stale_rollouts = output_dir / "rollouts"
@@ -134,6 +160,8 @@ def run_kind(
                     str(args.max_sequence_length),
                 ]
             )
+        else:
+            command.extend(["--max-steps", str(args.max_steps)])
         environment = os.environ.copy()
         environment.update(
             {
@@ -177,19 +205,18 @@ def run_kind(
                 suffix += 1
             directory.rename(destination)
 
-    subprocess.run(
-        [
-            sys.executable,
-            str(PROJECT_ROOT / "scripts/merge_eval_shards.py"),
-            "teacher" if kind == "teacher-forced" else "closed",
-            "--shards-dir",
-            str(root),
-            "--output-dir",
-            str(root),
-        ],
-        cwd=PROJECT_ROOT,
-        check=True,
-    )
+    merge_command = [
+        sys.executable,
+        str(PROJECT_ROOT / "scripts/merge_eval_shards.py"),
+        "teacher" if kind == "teacher-forced" else "closed",
+        "--shards-dir",
+        str(root),
+        "--output-dir",
+        str(root),
+    ]
+    if kind == "teacher-forced":
+        merge_command.extend(["--manifest", str(args.manifest)])
+    subprocess.run(merge_command, cwd=PROJECT_ROOT, check=True)
     print(f"step={step} {kind} complete across {len(devices)} GPUs", flush=True)
 
 
@@ -206,9 +233,10 @@ def main() -> None:
     )
     parser.add_argument("--devices", type=str, default="0,1,2,3,4,5,6,7")
     parser.add_argument("--minimum-free-mib", type=int, default=9000)
-    parser.add_argument("--vision-max-pixels", type=int, default=393216)
+    parser.add_argument("--vision-max-pixels", type=int, default=786432)
     parser.add_argument("--vision-min-pixels", type=int, default=65536)
-    parser.add_argument("--max-sequence-length", type=int, default=8192)
+    parser.add_argument("--max-sequence-length", type=int, default=131072)
+    parser.add_argument("--max-steps", type=int, default=24)
     args = parser.parse_args()
     args.run_dir = args.run_dir.resolve()
     args.manifest = args.manifest.resolve()

@@ -52,10 +52,34 @@ class PrivilegedExpert:
         ]
         return min(candidates, key=lambda item: item[1])
 
-    def act(self, current: Pose):
+    @staticmethod
+    def _round(values: np.ndarray, decimals: int) -> np.ndarray | None:
+        rounded = np.round(values, decimals)
+        return None if not np.any(rounded) else rounded
+
+    @staticmethod
+    def _partial(values: np.ndarray, rng: np.random.Generator) -> np.ndarray | None:
+        active = np.flatnonzero(np.abs(values) > 1e-10)
+        if not len(active):
+            return None
+        count = int(rng.integers(1, len(active) + 1))
+        selected = rng.choice(active, size=count, replace=False)
+        result = np.zeros(3, dtype=np.float64)
+        result[selected] = values[selected]
+        return result
+
+    def act(
+        self,
+        current: Pose,
+        rng: np.random.Generator | None = None,
+        observation_mode: ObservationMode = ObservationMode.SCENE,
+    ):
+        if rng is None:
+            rng = np.random.default_rng(0)
         rotation_error = self._rotation_error(current)
-        normalized_translation = np.linalg.norm(
-            (self.target.position - current.position) / self.target.size
+        target_diagonal = float(np.linalg.norm(self.target.size))
+        normalized_translation = float(
+            np.linalg.norm(self.target.position - current.position) / target_diagonal
         )
         log_scale_error = np.max(np.abs(np.log(self.target.size / current.size)))
 
@@ -70,46 +94,53 @@ class PrivilegedExpert:
             permutation, residual = self._best_permutation(current)
             improvement = rotation_error - residual
             if improvement >= self.thresholds.coarse_rotation_min_deg / 2:
-                if not self.coarse_view_requested:
+                if not self.coarse_view_requested and observation_mode is ObservationMode.SCENE:
                     self.coarse_view_requested = True
                     return SwitchObs()
                 self.coarse_view_requested = False
                 return permutation
 
-        relative = current.rotation.T @ self.target.rotation
-        # Uppercase means intrinsic rotations, matching Rz @ Rx @ Ry in pose.rotation_zxy.
-        delta_r = Rotation.from_matrix(relative).as_euler("ZXY", degrees=True)
-        next_rotation = current.rotation @ Rotation.from_euler(
-            "ZXY", delta_r, degrees=True
-        ).as_matrix()
-        delta_p = (next_rotation.T @ (self.target.position - current.position)) / current.size
+        if rotation_error > self.thresholds.rotation_stop_deg:
+            relative = current.rotation.T @ self.target.rotation
+            # Intrinsic Z-X-Y matches Lucida's GizmoAct rotation convention.
+            delta_r = Rotation.from_matrix(relative).as_euler("ZXY", degrees=True)
+            rotation_update = self._round(
+                self._partial(delta_r, rng) if delta_r is not None else delta_r,
+                self.thresholds.decimals,
+            )
+            if rotation_update is None:
+                return Stop()
+            return UpdatePose(rotate_zxy_deg=rotation_update)
+
+        local_delta = current.rotation.T @ (self.target.position - current.position)
+        delta_p = local_delta / current.size
         delta_s = self.target.size / current.size - 1.0
+        translation_active = normalized_translation > self.thresholds.translation_stop_fraction
+        scale_active = log_scale_error > self.thresholds.log_scale_stop
+        if translation_active:
+            selected_translation = self._partial(delta_p, rng)
+            delta_p = (
+                selected_translation
+                if selected_translation is not None
+                else np.zeros(3, dtype=np.float64)
+            )
+        else:
+            delta_p = np.zeros(3, dtype=np.float64)
+        if scale_active:
+            selected_scale = self._partial(delta_s, rng)
+            delta_s = (
+                selected_scale
+                if selected_scale is not None
+                else np.zeros(3, dtype=np.float64)
+            )
+        else:
+            delta_s = np.zeros(3, dtype=np.float64)
 
-        def rounded_or_none(values: np.ndarray, active: bool) -> np.ndarray | None:
-            return np.round(values, self.thresholds.decimals) if active else None
-
-        rotation_update = rounded_or_none(
-            delta_r, rotation_error > self.thresholds.rotation_stop_deg
-        )
-        translation_update = rounded_or_none(
-            delta_p, normalized_translation > self.thresholds.translation_stop_fraction
-        )
-        scale_update = rounded_or_none(
-            delta_s, log_scale_error > self.thresholds.log_scale_stop
-        )
-
-        # The text protocol is limited to ``decimals`` places. Once a residual
-        # quantizes entirely to zero it cannot be improved without oscillation.
-        def omit_zero(values: np.ndarray | None) -> np.ndarray | None:
-            return None if values is not None and not np.any(values) else values
-
-        rotation_update = omit_zero(rotation_update)
-        translation_update = omit_zero(translation_update)
-        scale_update = omit_zero(scale_update)
-        if rotation_update is None and translation_update is None and scale_update is None:
+        translation_update = self._round(delta_p, self.thresholds.decimals)
+        scale_update = self._round(delta_s, self.thresholds.decimals)
+        if translation_update is None and scale_update is None:
             return Stop()
         return UpdatePose(
-            rotate_zxy_deg=rotation_update,
             translate_local_fraction=translation_update,
             scale_fraction=scale_update,
         )

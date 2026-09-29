@@ -27,7 +27,7 @@ def write_csv(path: Path, fields: list[str], rows: list[dict]) -> None:
         writer.writerows(rows)
 
 
-def merge_teacher(root: Path, output: Path) -> None:
+def merge_teacher(root: Path, output: Path, expected_turns: int) -> None:
     shard_dirs = sorted(root.glob("shard_*"))
     if not shard_dirs:
         raise FileNotFoundError(f"no teacher-forced shards under {root}")
@@ -45,8 +45,8 @@ def merge_teacher(root: Path, output: Path) -> None:
     if not rows:
         raise ValueError("teacher-forced shards contained no turns")
     rows.sort(key=lambda row: (row["trajectory_id"], int(row["turn_index"])))
-    if len(rows) != 207:
-        raise ValueError(f"expected 207 supervised turns, found {len(rows)}")
+    if len(rows) != expected_turns:
+        raise ValueError(f"expected {expected_turns} supervised turns, found {len(rows)}")
     total_nll = sum(float(row["teacher_forced_nll_sum"]) for row in rows)
     total_tokens = sum(int(row["teacher_forced_token_count"]) for row in rows)
     count = len(rows)
@@ -142,9 +142,18 @@ def main() -> None:
     parser.add_argument("kind", choices=("teacher", "closed"))
     parser.add_argument("--shards-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--manifest", type=Path)
     args = parser.parse_args()
     if args.kind == "teacher":
-        merge_teacher(args.shards_dir, args.output_dir)
+        if args.manifest is None:
+            raise ValueError("teacher merge requires --manifest to count supervised turns")
+        manifest = json.loads(args.manifest.read_text())
+        expected_turns = sum(
+            bool(turn["supervise"])
+            for trajectory in manifest["trajectories"]
+            for turn in trajectory["turns"]
+        )
+        merge_teacher(args.shards_dir, args.output_dir, expected_turns)
     else:
         merge_closed(args.shards_dir, args.output_dir)
     print(f"merged {args.kind} evaluation shards from {args.shards_dir} into {args.output_dir}")

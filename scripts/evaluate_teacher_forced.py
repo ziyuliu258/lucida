@@ -25,9 +25,12 @@ from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 from lucida_mini.actions import PermuteAxis, Stop, SwitchObs, UpdatePose, parse_action
 from lucida_mini.schema import DatasetManifest
 from lucida_mini.serialization import action_to_text
-
-
-SYSTEM_PROMPT = """You control a 9-DoF object gizmo. Inspect the images and action history, then output exactly one valid GizmoAct XML action and no other text."""
+from lucida_mini.prompts import SYSTEM_PROMPT, instruction_for_turn
+from lucida_mini.vision import (
+    image_paths_in_messages,
+    validate_image_files,
+    validate_processed_image_grids,
+)
 
 
 def action_type(action: object) -> str:
@@ -53,7 +56,9 @@ def iter_supervised_turns(
     manifest: DatasetManifest, dataset_root: Path
 ) -> Iterator[dict]:
     """Yield records with precisely the history constructed by ``TurnDataset``."""
+    contexts = {context.context_id: context for context in manifest.contexts}
     for trajectory in manifest.trajectories:
+        context = contexts[trajectory.context_id]
         history: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
         injected_errors_before = 0
         for turn_index, turn in enumerate(trajectory.turns):
@@ -64,7 +69,10 @@ def iter_supervised_turns(
             history.append({
                 "role": "user",
                 "content": image_content
-                + [{"type": "text", "text": "Predict the next GizmoAct action."}],
+                + [{
+                    "type": "text",
+                    "text": instruction_for_turn(context, turn, dataset_root),
+                }],
             })
             if turn.supervise:
                 yield {
@@ -90,6 +98,7 @@ def encode_supervised_turn(
     messages: list[dict],
     answer: str,
     max_sequence_length: int,
+    vision_max_pixels: int,
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], torch.Tensor]:
     """Mirror GizmoCollator's prompt/full encoding and supervision mask."""
     from qwen_vl_utils import process_vision_info
@@ -101,6 +110,16 @@ def encode_supervised_turn(
     full_text = processor.apply_chat_template(
         full_messages, tokenize=False, add_generation_prompt=False
     )
+    image_paths = image_paths_in_messages(full_messages)
+    image_processor = processor.image_processor
+    patch_size = int(getattr(image_processor, "patch_size", 16))
+    merge_size = int(getattr(image_processor, "spatial_merge_size", 2))
+    image_sizes = validate_image_files(
+        image_paths,
+        vision_max_pixels,
+        patch_size=patch_size,
+        spatial_merge_size=merge_size,
+    )
     images, videos = process_vision_info(full_messages)
     full_inputs = processor(
         text=[full_text],
@@ -111,6 +130,7 @@ def encode_supervised_turn(
         max_length=max_sequence_length,
         return_tensors="pt",
     )
+    validate_processed_image_grids(full_inputs, image_sizes, patch_size=patch_size)
     prompt_inputs = processor(
         text=[prompt_text],
         images=images,
@@ -120,6 +140,7 @@ def encode_supervised_turn(
         max_length=max_sequence_length,
         return_tensors="pt",
     )
+    validate_processed_image_grids(prompt_inputs, image_sizes, patch_size=patch_size)
     if full_inputs["input_ids"].shape[1] >= max_sequence_length:
         raise ValueError(
             "sample reached --max-sequence-length; refusing to score a truncated action"
@@ -199,8 +220,8 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--step", type=int, required=True)
     parser.add_argument("--max-new-tokens", type=int, default=256)
-    parser.add_argument("--max-sequence-length", type=int, default=8192)
-    parser.add_argument("--vision-max-pixels", type=int, default=262144)
+    parser.add_argument("--max-sequence-length", type=int, default=131072)
+    parser.add_argument("--vision-max-pixels", type=int, default=786432)
     parser.add_argument("--vision-min-pixels", type=int, default=65536)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--shard-count", type=int, default=1)
@@ -222,6 +243,7 @@ def main() -> None:
         raise FileNotFoundError(
             f"manifest references {len(missing)} missing files; first: {missing[0]}"
         )
+    manifest.validate_corrected_inputs(args.dataset_root)
 
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
@@ -251,6 +273,7 @@ def main() -> None:
             example["messages"],
             example["answer"],
             args.max_sequence_length,
+            args.vision_max_pixels,
         )
         gold_canonical, gold_type = canonicalize_action(example["answer"])
         token_ce, token_nll, token_count = teacher_forced_ce(

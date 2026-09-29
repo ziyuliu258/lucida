@@ -1,0 +1,44 @@
+# Fresh fixed-set SFT run for the corrected observations and per-turn target cues.
+# Start from the base Qwen checkpoint; do not resume an adapter trained on the old inputs.
+model:
+  name_or_path: models/Qwen3-VL-2B-Instruct
+  fresh_base_only: true
+  dtype: bfloat16
+  freeze_vision_encoder: true
+  gradient_checkpointing: true
+  vision_max_pixels: 786432
+  vision_min_pixels: 65536
+lora:
+  rank: 16
+  alpha: 32
+  dropout: 0.0
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+    - qkv
+    - proj
+    - linear_fc1
+    - linear_fc2
+training:
+  seed: 20260928
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 1
+  learning_rate: 1.0e-5
+  weight_decay: 0.0
+  max_steps: 2000
+  warmup_ratio: 0.02
+  logging_steps: 1
+  save_steps: 200
+  max_sequence_length: 131072
+  bf16: true
+  overfit_loss_threshold: -1.0
+  overfit_loss_patience: 0
+distributed:
+  backend: nccl
+  launcher: torchrun
+  deepspeed_config: configs/zero3.json

@@ -69,6 +69,7 @@ def main() -> None:
     source_manifest = DatasetManifest.model_validate_json(source_manifest_bytes)
     if not source_manifest.frozen:
         raise ValueError("source manifest must be frozen")
+    source_manifest.validate_corrected_inputs(source_root)
 
     output_root.mkdir(parents=True)
     (output_root / "trajectories").mkdir()
@@ -104,13 +105,22 @@ def main() -> None:
                 rendered_paths = render_native_focus_observation(
                     context_dir, state.pose, output_root / image_rel,
                     mode=state.observation_mode,
+                    frame_index=(
+                        old_turn.observation_frame_index
+                        if old_turn.observation_frame_index is not None
+                        else min(old_turn.step, len(context.rgb_paths) - 1)
+                    ),
                 )
             else:
-                render(
+                rendered_paths = render(
                     context_dir, state.pose, output_root / image_rel,
                     mode=state.observation_mode,
+                    frame_index=(
+                        old_turn.observation_frame_index
+                        if old_turn.observation_frame_index is not None
+                        else min(old_turn.step, len(context.rgb_paths) - 1)
+                    ),
                 )
-                rendered_paths = [output_root / image_rel]
             before_mode = state.observation_mode
             action = parse_action(old_turn.action)
             state = execute_action(state, action)
@@ -129,6 +139,12 @@ def main() -> None:
                     observation_mode_before=before_mode,
                     observation_mode_after=state.observation_mode,
                     action=old_turn.action,
+                    injected_error_type=old_turn.injected_error_type,
+                    observation_frame_index=(
+                        old_turn.observation_frame_index
+                        if old_turn.observation_frame_index is not None
+                        else min(old_turn.step, len(context.rgb_paths) - 1)
+                    ),
                     injected_error=old_turn.injected_error,
                     supervise=old_turn.supervise,
                     state_before=old_turn.state_before,
@@ -168,7 +184,7 @@ def main() -> None:
         "switch_obs_turns": switch_count,
         "pose_and_action_replay_exact": True,
         "observation_modes": [mode.value for mode in ObservationMode],
-        "observation_layout": "native_rgb_mesh_and_focus_crop" if args.native_focus else "contact_sheet",
+        "observation_layout": "separate_native_raw_textured_overlay_rgb_colored_pointcloud_and_local_views",
     }
     (output_root / "regeneration_report.json").write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report, indent=2))

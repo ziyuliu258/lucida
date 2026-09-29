@@ -26,9 +26,12 @@ from transformers import (
 )
 
 from lucida_mini.schema import DatasetManifest
-
-
-SYSTEM_PROMPT = """You control a 9-DoF object gizmo. Inspect the images and action history, then output exactly one valid GizmoAct XML action and no other text."""
+from lucida_mini.prompts import SYSTEM_PROMPT, instruction_for_turn
+from lucida_mini.vision import (
+    image_paths_in_messages,
+    validate_image_files,
+    validate_processed_image_grids,
+)
 
 
 def semantic_action_spans(
@@ -259,7 +262,9 @@ class TurnDataset(Dataset):
     ):
         self.root = root
         self.examples: list[dict] = []
+        contexts = {context.context_id: context for context in manifest.contexts}
         for trajectory in manifest.trajectories:
+            context = contexts[trajectory.context_id]
             history: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
             for turn in trajectory.turns:
                 image_content = [
@@ -270,7 +275,10 @@ class TurnDataset(Dataset):
                     {
                         "role": "user",
                         "content": image_content
-                        + [{"type": "text", "text": "Predict the next GizmoAct action."}],
+                        + [{
+                            "type": "text",
+                            "text": instruction_for_turn(context, turn, root),
+                        }],
                     }
                 )
                 if turn.supervise:
@@ -304,6 +312,7 @@ class GizmoCollator:
     processor: object
     max_length: int
     action_weighting: dict | None = None
+    vision_max_pixels: int = 786432
 
     def _token_weights(
         self,
@@ -361,17 +370,29 @@ class GizmoCollator:
         full_text = self.processor.apply_chat_template(
             full_messages, tokenize=False, add_generation_prompt=False
         )
+        image_paths = image_paths_in_messages(full_messages)
+        image_processor = self.processor.image_processor
+        patch_size = int(getattr(image_processor, "patch_size", 16))
+        merge_size = int(getattr(image_processor, "spatial_merge_size", 2))
+        image_sizes = validate_image_files(
+            image_paths,
+            self.vision_max_pixels,
+            patch_size=patch_size,
+            spatial_merge_size=merge_size,
+        )
         images, videos = process_vision_info(full_messages)
         encoded = self.processor(
             text=[full_text], images=images, videos=videos,
             padding=False, truncation=True, max_length=self.max_length,
             return_tensors="pt",
         )
+        validate_processed_image_grids(encoded, image_sizes, patch_size=patch_size)
         prompt_encoded = self.processor(
             text=[prompt_text], images=images, videos=videos,
             padding=False, truncation=True, max_length=self.max_length,
             return_tensors="pt",
         )
+        validate_processed_image_grids(prompt_encoded, image_sizes, patch_size=patch_size)
         prefix = prompt_encoded["input_ids"].shape[1]
         if encoded["input_ids"].shape[1] >= self.max_length:
             raise ValueError("sample reached max_sequence_length; refusing silent action truncation")
@@ -427,6 +448,16 @@ def main() -> None:
 
     config = yaml.safe_load(args.config.read_text())
     train_config = config["training"]
+    if config["model"].get("fresh_base_only", False):
+        if args.init_adapter or args.resume_from_checkpoint:
+            raise ValueError(
+                "this corrected-input config requires a fresh run from the base model; "
+                "old adapters/checkpoints were trained on different observations"
+            )
+        if args.output_dir.exists() and any(args.output_dir.iterdir()):
+            raise FileExistsError(
+                f"fresh corrected-input training requires a new empty output directory: {args.output_dir}"
+            )
     # Bind before RNG initialization/model setup to avoid every DDP rank
     # creating an unnecessary CUDA context on the first visible GPU.
     if "LOCAL_RANK" in os.environ:
@@ -438,6 +469,7 @@ def main() -> None:
     missing = manifest.validate_files(args.dataset_root)
     if missing:
         raise FileNotFoundError(f"manifest references {len(missing)} missing files; first: {missing[0]}")
+    manifest.validate_corrected_inputs(args.dataset_root)
 
     model_path = args.model or config["model"]["name_or_path"]
     processor = AutoProcessor.from_pretrained(model_path)
@@ -504,6 +536,7 @@ def main() -> None:
             processor,
             train_config["max_sequence_length"],
             action_weighting,
+            int(config["model"]["vision_max_pixels"]),
         ),
         callbacks=[OverfitLoggingCallback(
             args.output_dir,

@@ -36,8 +36,9 @@ dist/
 !/models/README.md
 /outputs/
 
-# The source paper is kept locally; redistribute only after checking its terms
-/docs/lucida.pdf
+# Working documents, generated reports and the source paper stay local.
+# The root README.md remains the repository's published overview.
+/docs/
 
 # Logs and common model/checkpoint archives
 *.log

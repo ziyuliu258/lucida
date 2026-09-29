@@ -27,15 +27,17 @@ from lucida_mini.render import (
     render_ca1m_observation,
     render_foundation_observation,
     render_mesatask_observation,
-    render_native_focus_observation,
 )
 from lucida_mini.schema import DatasetManifest
 from lucida_mini.actions import parse_action
+from lucida_mini.prompts import SYSTEM_PROMPT, frame_index_for_turn, instruction_for_turn
 from lucida_mini.serialization import action_to_text
 from lucida_mini.state import GizmoState
-
-
-SYSTEM_PROMPT = """You control a 9-DoF object gizmo. Inspect the images and action history, then output exactly one valid GizmoAct XML action and no other text."""
+from lucida_mini.vision import (
+    image_paths_in_messages,
+    validate_image_files,
+    validate_processed_image_grids,
+)
 
 
 def to_pose(record) -> Pose:
@@ -46,14 +48,37 @@ def to_pose(record) -> Pose:
     )
 
 
-def generate_action(model, processor, messages: list[dict], max_new_tokens: int) -> str:
+def generate_action(
+    model,
+    processor,
+    messages: list[dict],
+    max_new_tokens: int,
+    max_sequence_length: int,
+    vision_max_pixels: int,
+) -> str:
     from qwen_vl_utils import process_vision_info
 
     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    image_paths = image_paths_in_messages(messages)
+    image_processor = processor.image_processor
+    patch_size = int(getattr(image_processor, "patch_size", 16))
+    merge_size = int(getattr(image_processor, "spatial_merge_size", 2))
+    image_sizes = validate_image_files(
+        image_paths,
+        vision_max_pixels,
+        patch_size=patch_size,
+        spatial_merge_size=merge_size,
+    )
     images, videos = process_vision_info(messages)
     inputs = processor(
         text=[text], images=images, videos=videos, padding=False, return_tensors="pt"
     )
+    validate_processed_image_grids(inputs, image_sizes, patch_size=patch_size)
+    if inputs["input_ids"].shape[1] + max_new_tokens > max_sequence_length:
+        raise ValueError(
+            f"rollout prompt plus generation reaches max_sequence_length={max_sequence_length}; "
+            "refusing to discard prior observations"
+        )
     inputs = {key: value.to(model.device) for key, value in inputs.items()}
     with torch.inference_mode():
         output = model.generate(
@@ -77,10 +102,11 @@ def main() -> None:
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--step", type=int, required=True)
-    parser.add_argument("--max-steps", type=int, default=12)
+    parser.add_argument("--max-steps", type=int, default=24)
     parser.add_argument("--max-new-tokens", type=int, default=256)
+    parser.add_argument("--max-sequence-length", type=int, default=131072)
     parser.add_argument("--surface-points", type=int, default=10000)
-    parser.add_argument("--vision-max-pixels", type=int, default=262144)
+    parser.add_argument("--vision-max-pixels", type=int, default=786432)
     parser.add_argument("--vision-min-pixels", type=int, default=65536)
     parser.add_argument("--shard-count", type=int, default=1)
     parser.add_argument("--shard-index", type=int, default=0)
@@ -93,11 +119,12 @@ def main() -> None:
         raise ValueError("shard index must be in [0, shard-count)")
 
     manifest = DatasetManifest.model_validate_json(args.manifest.read_text())
-    native_focus = any(
-        len(turn.observation_paths) > 1
-        for trajectory in manifest.trajectories
-        for turn in trajectory.turns
-    )
+    missing = manifest.validate_files(args.dataset_root)
+    if missing:
+        raise FileNotFoundError(
+            f"manifest references {len(missing)} missing files; first: {missing[0]}"
+        )
+    manifest.validate_corrected_inputs(args.dataset_root)
     contexts = {item.context_id: item for item in manifest.contexts}
     processor = AutoProcessor.from_pretrained(args.base_model)
     processor.image_processor.max_pixels = args.vision_max_pixels
@@ -143,29 +170,24 @@ def main() -> None:
         termination = "max_steps"
         rollout_dir = args.output_dir / "rollouts" / trajectory.trajectory_id
 
-        # The data generator deliberately inserts one recoverable, unsupervised
-        # perturbation in many trajectories.  It is present in the SFT history,
-        # but has no target label.  Reproduce that environment intervention here
-        # instead of incorrectly asking the model to predict an action it never
-        # received supervision for.
+        # Replay injected, recoverable environment errors as masked history;
+        # they remain visible to the model but are not predicted as labels.
         for turn_index, injected_action in iter_rollout_schedule(trajectory, args.max_steps):
             image_path = rollout_dir / f"step_{turn_index:02d}.png"
-            if native_focus:
-                image_paths = render_native_focus_observation(
-                    context_dir, current.pose, image_path,
-                    mode=current.observation_mode,
-                )
-            else:
-                renderer(
-                    context_dir, current.pose, image_path,
-                    mode=current.observation_mode,
-                )
-                image_paths = [image_path]
+            turn_context = {"step": turn_index}
+            frame_index = frame_index_for_turn(context, turn_context, args.dataset_root)
+            image_paths = renderer(
+                context_dir,
+                current.pose,
+                image_path,
+                mode=current.observation_mode,
+                frame_index=frame_index or 0,
+            )
             messages.append({
                 "role": "user",
                 "content": [
                     *({"type": "image", "image": str(path)} for path in image_paths),
-                    {"type": "text", "text": "Predict the next GizmoAct action."},
+                    {"type": "text", "text": instruction_for_turn(context, turn_context, args.dataset_root)},
                 ],
             })
             if injected_action is not None:
@@ -177,7 +199,14 @@ def main() -> None:
                 continue
 
             model_actions += 1
-            raw = generate_action(model, processor, messages, args.max_new_tokens)
+            raw = generate_action(
+                model,
+                processor,
+                messages,
+                args.max_new_tokens,
+                args.max_sequence_length,
+                args.vision_max_pixels,
+            )
             try:
                 action = parse_action(raw)
                 canonical = action_to_text(action)

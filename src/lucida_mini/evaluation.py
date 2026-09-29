@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 
-def rollout_protocol(max_steps: int = 12) -> dict:
+def rollout_protocol(max_steps: int = 24) -> dict:
     return {
         "name": "fixed_trajectory_error_replay",
-        "version": 2,
+        "version": 3,
         "max_steps": max_steps,
+        "observation_views": "separate_native_raw_overlay_colored_pointcloud_plus_optional_local_axes",
+        "ca1m_frame_schedule": "one_frame_per_turn_in_capture_order_then_hold_last",
+        "prompt_version": "target-cue-v1",
         "add_sb_success_fraction": 0.05,
         "rotation_success_deg": 5.0,
     }

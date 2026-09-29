@@ -29,8 +29,14 @@ def main() -> None:
     processor.image_processor.max_pixels = model["vision_max_pixels"]
     processor.image_processor.min_pixels = model["vision_min_pixels"]
     manifest = DatasetManifest.model_validate_json(args.manifest.read_text())
+    manifest.validate_corrected_inputs(args.dataset_root)
     dataset = TurnDataset(manifest, args.dataset_root, config.get("action_weighting"))
-    collator = GizmoCollator(processor, train["max_sequence_length"], config.get("action_weighting"))
+    collator = GizmoCollator(
+        processor,
+        train["max_sequence_length"],
+        config.get("action_weighting"),
+        int(model["vision_max_pixels"]),
+    )
 
     rows = []
     maximum = 0

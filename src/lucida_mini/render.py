@@ -9,9 +9,8 @@ from pathlib import Path
 
 os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 
-import cv2
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageDraw
 
 from .metrics import oriented_box_corners
 from .pose import Pose
@@ -24,12 +23,10 @@ BOX_EDGES = [
     for j in range(i + 1, 8)
     if bin(i ^ j).count("1") == 1
 ]
-TILE_SIZE = 384
-ORTHO_TILE_SIZE = 320
-MESH_RGB = np.array([255, 126, 18], dtype=np.float32)
-HIDDEN_RGB = np.array([35, 220, 85], dtype=np.float32)
-POINT_RGB = np.array([115, 193, 216], dtype=np.float32)
+ORTHO_SIZE = 320
+HIDDEN_RGB = np.array([54, 224, 128], dtype=np.uint8)
 AXIS_RGB = ((255, 45, 45), (45, 220, 70), (50, 110, 255))
+POINT_BACKGROUND = (246, 247, 249)
 
 
 @dataclass(frozen=True)
@@ -45,39 +42,41 @@ class CameraSpec:
     xmag: float = 0.0
     ymag: float = 0.0
 
-    def scaled(self, width: int, height: int) -> "CameraSpec":
-        sx, sy = width / self.width, height / self.height
-        if self.projection == "perspective":
-            return CameraSpec(
-                self.camera_to_world_gl,
-                width,
-                height,
-                self.projection,
-                fx=self.fx * sx,
-                fy=self.fy * sy,
-                cx=self.cx * sx,
-                cy=self.cy * sy,
-            )
-        return CameraSpec(
-            self.camera_to_world_gl,
-            width,
-            height,
-            self.projection,
-            xmag=self.xmag,
-            ymag=self.ymag,
-        )
+    def __post_init__(self) -> None:
+        transform = np.asarray(self.camera_to_world_gl, dtype=np.float64)
+        if transform.shape != (4, 4) or not np.isfinite(transform).all():
+            raise ValueError("camera_to_world_gl must be a finite 4x4 matrix")
+        rotation = transform[:3, :3]
+        if (
+            not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-4)
+            or not np.isclose(np.linalg.det(rotation), 1.0, atol=1e-4)
+            or not np.allclose(transform[3], [0.0, 0.0, 0.0, 1.0], atol=1e-6)
+        ):
+            raise ValueError("camera_to_world_gl must be a rigid right-handed transform")
+        if self.width <= 0 or self.height <= 0:
+            raise ValueError("camera resolution must be positive")
+        if self.projection == "perspective" and (
+            self.fx <= 0 or self.fy <= 0 or not np.isfinite([self.fx, self.fy, self.cx, self.cy]).all()
+        ):
+            raise ValueError("perspective camera requires finite positive focal lengths")
+        if self.projection == "orthographic" and (
+            self.xmag <= 0 or self.ymag <= 0
+        ):
+            raise ValueError("orthographic camera requires positive extents")
 
     def project(self, points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        points = np.asarray(points, dtype=np.float64)
-        camera = (self.camera_to_world_gl[:3, :3].T @ (points - self.camera_to_world_gl[:3, 3]).T).T
+        points = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+        camera = (
+            self.camera_to_world_gl[:3, :3].T
+            @ (points - self.camera_to_world_gl[:3, 3]).T
+        ).T
+        depth = -camera[:, 2]
         if self.projection == "perspective":
-            depth = -camera[:, 2]
             valid = depth > 1e-6
             pixels = np.full((len(points), 2), np.nan, dtype=np.float64)
             pixels[valid, 0] = self.fx * camera[valid, 0] / depth[valid] + self.cx
             pixels[valid, 1] = self.cy - self.fy * camera[valid, 1] / depth[valid]
             return pixels, depth
-        depth = -camera[:, 2]
         pixels = np.column_stack(
             (
                 self.width / 2 + camera[:, 0] * self.width / (2 * self.xmag),
@@ -131,30 +130,37 @@ atexit.register(_delete_renderers)
 
 
 @lru_cache(maxsize=32)
-def _mesh_for_render(path: str, renderer_width: int, renderer_height: int, use_source_material: bool = False):
+def _meshes_for_render(path: str) -> tuple[tuple[object, np.ndarray], ...]:
     import pyrender
     import trimesh
 
-    mesh = trimesh.load(path, force="mesh", process=False)
-    if use_source_material:
-        # Keep the GLB's UV map and PBR texture for presentation renders.
-        return pyrender.Mesh.from_trimesh(mesh, smooth=True)
-    material = pyrender.MetallicRoughnessMaterial(
-        baseColorFactor=(1.0, 0.37, 0.035, 1.0),
-        metallicFactor=0.0,
-        roughnessFactor=0.9,
-        alphaMode="OPAQUE",
-        doubleSided=True,
+    loaded = trimesh.load(path, force="scene", process=False)
+    if isinstance(loaded, trimesh.Scene):
+        instances = []
+        for node in loaded.graph.nodes_geometry:
+            transform, geometry_name = loaded.graph.get(node)
+            geometry = loaded.geometry[geometry_name]
+            if isinstance(geometry, trimesh.Trimesh) and len(geometry.faces):
+                instances.append((geometry, np.asarray(transform, dtype=np.float64)))
+    elif isinstance(loaded, trimesh.Trimesh) and len(loaded.faces):
+        instances = [(loaded, np.eye(4, dtype=np.float64))]
+    else:
+        instances = []
+    if not instances:
+        raise ValueError(f"asset has no triangle geometry: {path}")
+
+    # Keep each scene mesh and its object-local transform separate. Flattening
+    # a textured GLB with force="mesh" can lose material and instance data.
+    return tuple(
+        (pyrender.Mesh.from_trimesh(geometry.copy(), smooth=True), transform)
+        for geometry, transform in instances
     )
-    return pyrender.Mesh.from_trimesh(mesh, material=material, smooth=False)
 
 
 @lru_cache(maxsize=16)
 def _point_cloud(path: str) -> np.ndarray:
     points = np.asarray(np.load(path), dtype=np.float64).reshape(-1, 3)
-    if len(points) > 3500:
-        points = points[np.linspace(0, len(points) - 1, 3500, dtype=np.int64)]
-    return points
+    return points[np.isfinite(points).all(axis=1)]
 
 
 def _pose_matrix(pose: Pose) -> np.ndarray:
@@ -164,39 +170,33 @@ def _pose_matrix(pose: Pose) -> np.ndarray:
     return transform
 
 
-def _render_depth(
-    mesh_path: Path, pose: Pose, spec: CameraSpec, use_source_material: bool = False
-) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+def _render_mesh(mesh_path: Path, pose: Pose, spec: CameraSpec) -> tuple[np.ndarray, np.ndarray]:
     import pyrender
 
     scene = pyrender.Scene(
         bg_color=np.array([0.0, 0.0, 0.0, 0.0]),
         ambient_light=np.array([1.0, 1.0, 1.0]),
     )
-    scene.add(
-        _mesh_for_render(
-            str(mesh_path), spec.width, spec.height,
-            use_source_material=use_source_material,
-        ),
-        pose=_pose_matrix(pose),
-    )
-    camera = _camera_for_pyrender(spec)
-    scene.add(camera, pose=spec.camera_to_world_gl)
+    pose_matrix = _pose_matrix(pose)
+    for mesh, asset_transform in _meshes_for_render(str(mesh_path)):
+        scene.add(mesh, pose=pose_matrix @ asset_transform)
+    scene.add(_camera_for_pyrender(spec), pose=spec.camera_to_world_gl)
     scene.add(
         pyrender.DirectionalLight(color=np.ones(3), intensity=2.5),
         pose=spec.camera_to_world_gl,
     )
     color, depth = _renderer(spec.width, spec.height).render(scene)
-    depth = np.asarray(depth, dtype=np.float32)
-    if use_source_material:
-        return depth, np.asarray(color[..., :3], dtype=np.uint8)
-    return depth
+    return np.asarray(color[..., :3], dtype=np.uint8), np.asarray(depth, dtype=np.float32)
 
 
 def _foundation_camera(camera: dict) -> CameraSpec:
     width, height = camera["resolution_wh"]
     view_row = np.asarray(camera["world_to_camera_row_major"], dtype=np.float64)
     projection = np.asarray(camera["projection_row_major"], dtype=np.float64)
+    if view_row.shape != (4, 4) or projection.shape != (4, 4):
+        raise ValueError("FoundationPose camera matrices must both be 4x4")
+    if not (np.isfinite(view_row).all() and np.isfinite(projection).all()):
+        raise ValueError("FoundationPose camera matrices must be finite")
     camera_to_world = np.linalg.inv(view_row.T)
     return CameraSpec(
         camera_to_world_gl=camera_to_world,
@@ -210,11 +210,34 @@ def _foundation_camera(camera: dict) -> CameraSpec:
     )
 
 
-def _ca1m_camera(camera: dict) -> CameraSpec:
+def _pinhole_camera(camera: dict) -> CameraSpec:
+    if "camera_to_world" not in camera or "rgb_intrinsic" not in camera:
+        raise ValueError(
+            "scene camera must provide calibrated camera_to_world and rgb_intrinsic; "
+            "approximate display projections are not valid training inputs"
+        )
     width, height = camera["resolution_wh"]
     camera_to_world_cv = np.asarray(camera["camera_to_world"], dtype=np.float64)
+    if camera_to_world_cv.shape != (4, 4):
+        raise ValueError("camera_to_world must be a 4x4 calibrated matrix")
     cv_to_gl = np.diag([1.0, -1.0, -1.0, 1.0])
     intrinsic = np.asarray(camera["rgb_intrinsic"], dtype=np.float64)
+    if intrinsic.shape != (3, 3):
+        raise ValueError("rgb_intrinsic must be a 3x3 calibrated matrix")
+    if not np.isfinite(camera_to_world_cv).all() or not np.isfinite(intrinsic).all():
+        raise ValueError("camera calibration values must be finite")
+    if (
+        not np.allclose(intrinsic[2], [0.0, 0.0, 1.0], atol=1e-6)
+        or not np.isclose(intrinsic[0, 1], 0.0, atol=1e-6)
+        or not np.isclose(intrinsic[1, 0], 0.0, atol=1e-6)
+    ):
+        raise ValueError("camera intrinsic must use the supported pinhole matrix form")
+    if (
+        not np.allclose(camera_to_world_cv[:3, :3].T @ camera_to_world_cv[:3, :3], np.eye(3), atol=1e-4)
+        or not np.isclose(np.linalg.det(camera_to_world_cv[:3, :3]), 1.0, atol=1e-4)
+        or not np.allclose(camera_to_world_cv[3], [0.0, 0.0, 0.0, 1.0], atol=1e-6)
+    ):
+        raise ValueError("camera_to_world must be a rigid right-handed transform")
     return CameraSpec(
         camera_to_world_gl=camera_to_world_cv @ cv_to_gl,
         width=int(width),
@@ -227,235 +250,222 @@ def _ca1m_camera(camera: dict) -> CameraSpec:
     )
 
 
-def _fit_viewport(width: int, height: int, box: int = TILE_SIZE) -> tuple[int, int]:
-    scale = min(box / width, box / height)
-    return max(1, int(round(width * scale))), max(1, int(round(height * scale)))
+def _camera_for_source(kind: str, camera: dict, view_index: int) -> CameraSpec:
+    if kind == "foundationpose":
+        return _foundation_camera(camera)
+    if kind == "ca1m_objects":
+        views = camera.get("views", [])
+        if not views:
+            raise ValueError("CA-1M camera.json contains no calibrated views")
+        return _pinhole_camera(views[min(view_index, len(views) - 1)])
+    if kind == "populated_3d_front":
+        return _pinhole_camera(camera)
+    raise ValueError(f"unsupported scene source: {kind}")
 
 
-def _mesh_overlay(
-    background: Image.Image,
-    mesh_path: Path,
-    pose: Pose,
-    spec: CameraSpec,
-    observed_depth: np.ndarray | None,
-    point_cloud: np.ndarray | None,
-    use_source_material: bool = False,
-) -> Image.Image:
-    width, height = spec.width, spec.height
-    base = np.asarray(background.convert("RGB").resize((width, height), Image.Resampling.LANCZOS)).copy()
-
-    if point_cloud is not None and len(point_cloud):
-        pixels, depths = spec.project(point_cloud)
-        xy = np.rint(pixels).astype(np.int64, casting="unsafe")
-        valid = (
-            np.isfinite(pixels).all(axis=1)
-            & (depths > 0)
-            & (xy[:, 0] >= 0)
-            & (xy[:, 0] < width)
-            & (xy[:, 1] >= 0)
-            & (xy[:, 1] < height)
-        )
-        cloud_layer = base.copy()
-        cloud_layer[xy[valid, 1], xy[valid, 0]] = POINT_RGB.astype(np.uint8)
-        base = cv2.addWeighted(base, 0.84, cloud_layer, 0.16, 0)
-
-    spec = spec.scaled(width, height)
-    render = _render_depth(mesh_path, pose, spec, use_source_material)
-    if use_source_material:
-        mesh_depth, textured_color = render
-    else:
-        mesh_depth, textured_color = render, None
-    visible = mesh_depth > 1e-6
-    hidden = np.zeros_like(visible)
-    if observed_depth is not None:
-        sensor = np.asarray(observed_depth, dtype=np.float32)
-        if sensor.shape != (height, width):
-            sensor = cv2.resize(sensor, (width, height), interpolation=cv2.INTER_NEAREST)
-        valid_sensor = np.isfinite(sensor) & (sensor > 0)
-        hidden = visible & valid_sensor & (mesh_depth > sensor + 0.015)
-    shown = visible & ~hidden
-    if textured_color is not None:
-        # The display-only terminal image shows the asset's own mapped color
-        # and preserves the original scene at pixel locations outside the mesh.
-        alpha = 0.88
-        base[shown] = (
-            base[shown].astype(np.float32) * (1.0 - alpha)
-            + textured_color[shown].astype(np.float32) * alpha
-        ).astype(np.uint8)
-        base[hidden] = (
-            textured_color[hidden].astype(np.float32) * 0.48
-            + np.asarray(HIDDEN_RGB) * 0.52
-        ).astype(np.uint8)
-    else:
-        alpha = 0.48
-        base[shown] = (
-            base[shown].astype(np.float32) * (1.0 - alpha) + MESH_RGB * alpha
-        ).astype(np.uint8)
-        base[hidden] = (
-            base[hidden].astype(np.float32) * (1.0 - alpha) + HIDDEN_RGB * alpha
-        ).astype(np.uint8)
-
-    overlay = Image.fromarray(base, mode="RGB")
-    draw = ImageDraw.Draw(overlay)
-    _draw_gizmo(draw, spec, pose, show_bounds=not use_source_material)
-    return overlay
+def _derive_path(output: Path, suffix: str) -> Path:
+    return output.with_name(f"{output.stem}_{suffix}{output.suffix}")
 
 
-def _draw_gizmo(
-    draw: ImageDraw.ImageDraw, spec: CameraSpec, pose: Pose, show_bounds: bool = True
-) -> None:
-    if show_bounds:
-        corners = oriented_box_corners(pose)
-        box_pixels, box_depth = spec.project(corners)
-        for first, second in BOX_EDGES:
-            if box_depth[first] > 0 or box_depth[second] > 0:
+def _save_rgb(path: Path, rgb: np.ndarray | Image.Image) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    image = rgb if isinstance(rgb, Image.Image) else Image.fromarray(rgb.astype(np.uint8), "RGB")
+    image.convert("RGB").save(path, optimize=True)
+
+
+def _draw_gizmo(image: np.ndarray, spec: CameraSpec, pose: Pose) -> np.ndarray:
+    canvas = Image.fromarray(image.astype(np.uint8), "RGB")
+    draw = ImageDraw.Draw(canvas)
+    corners = oriented_box_corners(pose)
+    pixels, depths = spec.project(corners)
+    line_width = max(2, spec.width // 260)
+    for first, second in BOX_EDGES:
+        if depths[first] > 0 or depths[second] > 0:
+            if np.isfinite(pixels[[first, second]]).all():
                 draw.line(
-                    [tuple(box_pixels[first]), tuple(box_pixels[second])],
-                    fill=(255, 222, 0),
-                    width=max(1, spec.width // 170),
+                    [tuple(pixels[first]), tuple(pixels[second])],
+                    fill=(255, 220, 0),
+                    width=line_width,
                 )
 
     axis_length = 0.7 * float(np.min(pose.size))
     axes = np.vstack(
-        [pose.position, *(pose.position + pose.rotation[:, index] * axis_length for index in range(3))]
+        [pose.position, *(pose.position + pose.rotation[:, axis] * axis_length for axis in range(3))]
     )
-    pixels, depths = spec.project(axes)
+    axis_pixels, axis_depths = spec.project(axes)
     for index, color in enumerate(AXIS_RGB, start=1):
-        if depths[0] > 0 and depths[index] > 0 and np.isfinite(pixels[[0, index]]).all():
+        if axis_depths[0] > 0 and axis_depths[index] > 0 and np.isfinite(axis_pixels[[0, index]]).all():
             draw.line(
-                [tuple(pixels[0]), tuple(pixels[index])],
+                [tuple(axis_pixels[0]), tuple(axis_pixels[index])],
                 fill=color,
-                width=max(2, spec.width // 90),
+                width=max(3, spec.width // 120),
             )
+    return np.asarray(canvas)
 
 
-def _panel(image: Image.Image, label: str, size: int = TILE_SIZE) -> Image.Image:
-    panel = Image.new("RGB", (size, size), (238, 240, 243))
-    inner = ImageOps.contain(image.convert("RGB"), (size, size - 28), Image.Resampling.LANCZOS)
-    x = (size - inner.width) // 2
-    y = 24 + (size - 28 - inner.height) // 2
-    panel.paste(inner, (x, y))
-    draw = ImageDraw.Draw(panel)
-    draw.rectangle((0, 0, size, 22), fill=(24, 28, 34))
-    draw.text((8, 4), label, fill=(255, 255, 255))
-    return panel
-
-
-def _font(size: int = 23):
-    for path in (
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
-    ):
-        if Path(path).is_file():
-            return ImageFont.truetype(path, size=size)
-    return ImageFont.load_default()
-
-
-def _title(canvas: Image.Image, title: str) -> None:
-    draw = ImageDraw.Draw(canvas)
-    draw.rectangle((0, 0, canvas.width, 32), fill=(255, 255, 255))
-    draw.text((8, 5), title, fill=(15, 15, 15), font=_font(20))
-
-
-def _save_panels(output: Path, title: str, panels: list[Image.Image], columns: int) -> None:
-    rows = (len(panels) + columns - 1) // columns
-    canvas = Image.new("RGB", (columns * TILE_SIZE, rows * TILE_SIZE + 34), "white")
-    _title(canvas, title)
-    for index, panel in enumerate(panels):
-        canvas.paste(
-            panel,
-            ((index % columns) * TILE_SIZE, 34 + (index // columns) * TILE_SIZE),
+def _project_frontmost_cloud(
+    points: np.ndarray,
+    spec: CameraSpec,
+    source_rgb: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Project XYZ into the calibrated RGB view and transfer exact pixel colors."""
+    if source_rgb.shape[:2] != (spec.height, spec.width):
+        raise ValueError(
+            f"RGB size {source_rgb.shape[1]}x{source_rgb.shape[0]} does not match "
+            f"calibration {spec.width}x{spec.height}"
         )
-    output.parent.mkdir(parents=True, exist_ok=True)
-    canvas.save(output, optimize=True)
+    pixels, depths = spec.project(points)
+    safe_pixels = np.where(np.isfinite(pixels), pixels, -1.0)
+    xy = np.rint(safe_pixels).astype(np.int64)
+    valid = (
+        np.isfinite(pixels).all(axis=1)
+        & (depths > 1e-6)
+        & (xy[:, 0] >= 0)
+        & (xy[:, 0] < spec.width)
+        & (xy[:, 1] >= 0)
+        & (xy[:, 1] < spec.height)
+    )
+    candidates = np.flatnonzero(valid)
+    if not len(candidates):
+        return np.empty((0, 3), dtype=np.float64), np.empty((0, 3), dtype=np.uint8)
+    flat = xy[candidates, 1] * spec.width + xy[candidates, 0]
+    depth_buffer = np.full(spec.width * spec.height, np.inf, dtype=np.float32)
+    np.minimum.at(depth_buffer, flat, depths[candidates].astype(np.float32))
+    front = depths[candidates] <= depth_buffer[flat] + 1e-5
+    selected = candidates[front]
+    selected_xy = xy[selected]
+    colors = source_rgb[selected_xy[:, 1], selected_xy[:, 0]].astype(np.uint8)
+    return points[selected], colors
 
 
-def _reference_panel(
-    image_path: Path,
-    bbox: list[float] | None,
-    label: str,
-) -> Image.Image:
-    image = Image.open(image_path).convert("RGB")
-    if bbox is not None:
-        draw = ImageDraw.Draw(image)
-        draw.rectangle(tuple(bbox), outline=(255, 222, 0), width=max(2, image.width // 250))
-    return _panel(image, label)
+def _rasterize_cloud(
+    points: np.ndarray,
+    colors: np.ndarray,
+    spec: CameraSpec,
+    background: tuple[int, int, int] = POINT_BACKGROUND,
+) -> tuple[np.ndarray, np.ndarray]:
+    canvas = np.full((spec.height, spec.width, 3), background, dtype=np.uint8)
+    depth_buffer = np.full((spec.height, spec.width), np.inf, dtype=np.float32)
+    if not len(points):
+        return canvas, depth_buffer
+    pixels, depths = spec.project(points)
+    safe_pixels = np.where(np.isfinite(pixels), pixels, -1.0)
+    xy = np.rint(safe_pixels).astype(np.int64)
+    valid = (
+        np.isfinite(pixels).all(axis=1)
+        & (depths > 1e-6)
+        & (xy[:, 0] >= 0)
+        & (xy[:, 0] < spec.width)
+        & (xy[:, 1] >= 0)
+        & (xy[:, 1] < spec.height)
+    )
+    candidates = np.flatnonzero(valid)
+    if not len(candidates):
+        return canvas, depth_buffer
+    flat = xy[candidates, 1] * spec.width + xy[candidates, 0]
+    center_depth = np.full(spec.width * spec.height, np.inf, dtype=np.float32)
+    np.minimum.at(center_depth, flat, depths[candidates].astype(np.float32))
+    front = depths[candidates] <= center_depth[flat] + 1e-5
+    selected = candidates[front]
+    x, y = xy[selected, 0], xy[selected, 1]
+    rgb = colors[selected]
+    z = depths[selected].astype(np.float32)
+    # A 3x3 point footprint makes the cloud legible. Build its depth buffer
+    # from the same footprint so the green hidden-surface cue has no 1-pixel
+    # holes around otherwise visible scene points.
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            px, py = x + dx, y + dy
+            inside = (px >= 0) & (px < spec.width) & (py >= 0) & (py < spec.height)
+            selected_inside = np.flatnonzero(inside)
+            if len(selected_inside):
+                np.minimum.at(
+                    depth_buffer,
+                    (py[selected_inside], px[selected_inside]),
+                    z[selected_inside],
+                )
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            px, py = x + dx, y + dy
+            inside = (px >= 0) & (px < spec.width) & (py >= 0) & (py < spec.height)
+            selected_inside = np.flatnonzero(inside)
+            if len(selected_inside):
+                px_in, py_in = px[selected_inside], py[selected_inside]
+                visible = z[selected_inside] <= depth_buffer[py_in, px_in] + 1e-5
+                points_to_draw = selected_inside[visible]
+                canvas[py[points_to_draw], px[points_to_draw]] = rgb[points_to_draw]
+    return canvas, depth_buffer
 
 
-def _label_native(image: Image.Image, label: str) -> Image.Image:
-    labeled = image.convert("RGB").copy()
-    draw = ImageDraw.Draw(labeled)
-    draw.rectangle((0, 0, labeled.width, 22), fill=(24, 28, 34))
-    draw.text((8, 4), label, fill=(255, 255, 255))
-    return labeled
+def _blend_mesh(
+    background: np.ndarray,
+    mesh_rgb: np.ndarray,
+    mesh_depth: np.ndarray,
+    cloud_depth: np.ndarray | None = None,
+    show_occlusion: bool = False,
+) -> np.ndarray:
+    result = background.copy()
+    mesh = mesh_depth > 1e-6
+    hidden = np.zeros_like(mesh)
+    if show_occlusion and cloud_depth is not None:
+        hidden = mesh & np.isfinite(cloud_depth) & (cloud_depth + 0.012 < mesh_depth)
+    visible = mesh & ~hidden
+    alpha = 0.82
+    result[visible] = (
+        result[visible].astype(np.float32) * (1.0 - alpha)
+        + mesh_rgb[visible].astype(np.float32) * alpha
+    ).astype(np.uint8)
+    if np.any(hidden):
+        tinted = mesh_rgb[hidden].astype(np.float32) * 0.45 + HIDDEN_RGB.astype(np.float32) * 0.55
+        result[hidden] = (
+            result[hidden].astype(np.float32) * 0.32 + tinted * 0.68
+        ).astype(np.uint8)
+    return result
 
 
-def _focus_crop_box(
-    bbox: list[float], image_size: tuple[int, int]
-) -> tuple[int, int, int, int]:
-    """Use one fixed target-centered crop for every state of a context."""
-    width, height = image_size
-    target = np.asarray(bbox, dtype=np.float64)
-    center = (target[:2] + target[2:]) / 2
-    side = int(np.ceil(max(96.0, 4.0 * float(np.max(target[2:] - target[:2])))))
-    side = min(side, width, height)
-    left = int(np.clip(round(center[0] - side / 2), 0, width - side))
-    top = int(np.clip(round(center[1] - side / 2), 0, height - side))
-    return left, top, left + side, top + side
-
-
-def _save_native_scene_set(
-    output: Path,
-    source: Image.Image,
-    current: Image.Image,
-    bbox: list[float],
-) -> list[Path]:
-    """Keep both full frames at native resolution and add a shared target crop."""
-    reference = source.convert("RGB").copy()
-    draw = ImageDraw.Draw(reference)
-    draw.rectangle(tuple(bbox), outline=(255, 222, 0), width=max(2, source.width // 250))
-    crop_box = _focus_crop_box(bbox, source.size)
-    crop_size = 256
-    focus = Image.new("RGB", (2 * crop_size, crop_size), "white")
-    for index, frame in enumerate((reference, current)):
-        cropped = frame.crop(crop_box).resize(
-            (crop_size, crop_size), Image.Resampling.LANCZOS
-        )
-        focus.paste(cropped, (index * crop_size, 0))
-    focus = _label_native(focus, "REFERENCE CROP                    CURRENT MESH CROP")
-    paths = [
-        output.with_name(f"{output.stem}_reference.png"),
-        output.with_name(f"{output.stem}_current.png"),
-        output.with_name(f"{output.stem}_focus.png"),
-    ]
-    output.parent.mkdir(parents=True, exist_ok=True)
-    for path, image in zip(
-        paths,
+def _ca1m_cloud(context_dir: Path, context: dict, view_index: int) -> np.ndarray:
+    view = context["views"][view_index]
+    cloud_path = view.get("point_cloud_path")
+    if cloud_path:
+        return _point_cloud(str(context_dir / cloud_path))
+    depth_path = context_dir / view["depth_path"]
+    depth_mm = np.asarray(Image.open(depth_path), dtype=np.float64)
+    intrinsic = np.asarray(view["depth_intrinsic"], dtype=np.float64)
+    depth = depth_mm / 1000.0
+    rows, cols = np.indices(depth.shape)
+    valid = (depth > 0) & np.isfinite(depth) & (depth < 10.0)
+    stride = int(context.get("point_cloud_stride", 2))
+    valid = valid[::stride, ::stride]
+    rows = rows[::stride, ::stride][valid]
+    cols = cols[::stride, ::stride][valid]
+    z = depth[::stride, ::stride][valid]
+    camera_xyz = np.column_stack(
         (
-            _label_native(reference, "REFERENCE RGB / TARGET BOX"),
-            _label_native(current, "CURRENT MESH / SCENE"),
-            focus,
-        ),
-    ):
-        image.save(path, optimize=True)
-    return paths
+            (cols - intrinsic[0, 2]) * z / intrinsic[0, 0],
+            (rows - intrinsic[1, 2]) * z / intrinsic[1, 1],
+            z,
+            np.ones(len(z)),
+        )
+    )
+    camera_to_world = np.asarray(view["camera_to_world"], dtype=np.float64)
+    world = (camera_to_world @ camera_xyz.T).T[:, :3]
+    return world.astype(np.float64)
 
 
-def _observation_depth(context_dir: Path, kind: str, view_index: int = 0) -> np.ndarray | None:
-    if kind == "foundationpose":
-        path = context_dir / "depth_m.npy"
-        return np.load(path).astype(np.float32) if path.exists() else None
+def _load_scene_cloud(
+    context_dir: Path,
+    context: dict,
+    kind: str,
+    view_index: int,
+) -> np.ndarray:
     if kind == "ca1m_objects":
-        path = context_dir / f"view_{view_index:02d}_depth_mm.png"
-        if not path.exists():
-            return None
-        return np.asarray(Image.open(path), dtype=np.float32) / 1000.0
-    return None
-
-
-def _load_cloud(context_dir: Path) -> np.ndarray | None:
-    path = context_dir / "point_cloud_world_m.npy"
-    return _point_cloud(str(path)) if path.exists() else None
+        # Each interaction uses one frame's depth, never a cloud merged from
+        # other timestamps in the same capture.
+        return _ca1m_cloud(context_dir, context, view_index)
+    path = context_dir / context["point_cloud_path"]
+    if not path.is_file():
+        raise FileNotFoundError(f"scene point cloud is required: {path}")
+    return _point_cloud(str(path))
 
 
 def _axis_camera(pose: Pose, axis: int, sign: int, size: int) -> CameraSpec:
@@ -469,8 +479,8 @@ def _axis_camera(pose: Pose, axis: int, sign: int, size: int) -> CameraSpec:
     camera_to_world = np.eye(4, dtype=np.float64)
     camera_to_world[:3, :3] = pose.rotation @ rotation_local
     back_world = camera_to_world[:3, 2]
-    radius = max(float(np.max(pose.size)) * 0.72, 0.01)
-    camera_to_world[:3, 3] = pose.position + back_world * max(float(np.max(pose.size)) * 4.0, 1.0)
+    radius = max(float(np.max(pose.size)) * 1.15, 0.01)
+    camera_to_world[:3, 3] = pose.position + back_world * (radius * 4.0 + 0.02)
     return CameraSpec(
         camera_to_world_gl=camera_to_world,
         width=size,
@@ -481,209 +491,110 @@ def _axis_camera(pose: Pose, axis: int, sign: int, size: int) -> CameraSpec:
     )
 
 
-def _render_six_axis(
-    context_dir: Path,
-    mesh_path: Path,
-    pose: Pose,
-    title: str,
-) -> Image.Image:
-    panels: list[Image.Image] = []
-    cloud = _load_cloud(context_dir)
-    for axis, axis_name in enumerate(("X", "Y", "Z")):
-        for sign, sign_name in ((1, "+"), (-1, "-")):
-            spec = _axis_camera(pose, axis, sign, ORTHO_TILE_SIZE)
-            depth = _render_depth(mesh_path, pose, spec)
-            pixels = Image.new("RGB", (ORTHO_TILE_SIZE, ORTHO_TILE_SIZE), (248, 249, 251))
-            array = np.asarray(pixels).copy()
-            if cloud is not None and len(cloud):
-                cloud_pixels, cloud_depth = spec.project(cloud)
-                xy = np.rint(cloud_pixels).astype(np.int64, casting="unsafe")
-                valid = (
-                    np.isfinite(cloud_pixels).all(axis=1)
-                    & (cloud_depth > 0)
-                    & (xy[:, 0] >= 0)
-                    & (xy[:, 0] < ORTHO_TILE_SIZE)
-                    & (xy[:, 1] >= 0)
-                    & (xy[:, 1] < ORTHO_TILE_SIZE)
-                )
-                array[xy[valid, 1], xy[valid, 0]] = POINT_RGB.astype(np.uint8)
-            mesh_visible = depth > 1e-6
-            array[mesh_visible] = MESH_RGB.astype(np.uint8)
-            panel = Image.fromarray(array)
-            draw = ImageDraw.Draw(panel)
-            _draw_gizmo(draw, spec, pose)
-            label = f"LOCAL {sign_name}{axis_name}"
-            panel = _panel(panel, label, ORTHO_TILE_SIZE)
-            panels.append(panel)
-
-    # Six 320px views occupy 614,400 pixels; the model processor's configured
-    # ceiling resizes the contact sheet without multiplying per-turn images.
-    rows = 2
-    canvas = Image.new(
-        "RGB",
-        (3 * ORTHO_TILE_SIZE, rows * ORTHO_TILE_SIZE + 34),
-        "white",
-    )
-    _title(canvas, "GizmoAct / SIX LOCAL-AXIS VIEWS")
-    for index, panel in enumerate(panels):
-        canvas.paste(
-            panel,
-            ((index // 2) * ORTHO_TILE_SIZE, 34 + (index % 2) * ORTHO_TILE_SIZE),
+def _validate_populated_scene(context_dir: Path, context: dict, camera: dict) -> None:
+    required = ("scene_identifier", "support_surface_id", "layout_to_world", "scene_geometry_path")
+    missing = [key for key in required if not context.get(key)]
+    if missing:
+        raise ValueError(
+            "refusing to render the legacy MesaTask proxy as populated_3d_front; "
+            f"real MesaTask + 3D-FRONT scene metadata is missing {missing}"
         )
-    return canvas
+    scene_path = context_dir / context["scene_geometry_path"]
+    if not scene_path.is_file():
+        raise FileNotFoundError(f"combined 3D-FRONT scene geometry is missing: {scene_path}")
+    _pinhole_camera(camera)
 
 
-def _save_observation(
+def _selected_frame(
+    context_dir: Path,
+    context: dict,
+    camera_data: dict,
+    kind: str,
+    frame_index: int,
+) -> tuple[Image.Image, CameraSpec, np.ndarray]:
+    if kind == "ca1m_objects":
+        views = camera_data.get("views", [])
+        records = context.get("views", [])
+        if not views or not records or len(views) != len(records):
+            raise ValueError("CA-1M context must contain matching per-frame camera and RGB-D records")
+        index = min(max(int(frame_index), 0), len(views) - 1)
+        view = records[index]
+        source = Image.open(context_dir / view["rgb_path"]).convert("RGB")
+        spec = _camera_for_source(kind, camera_data, index)
+        cloud = _load_scene_cloud(context_dir, context, kind, index)
+    else:
+        index = 0
+        source = Image.open(context_dir / context["rgb_paths"][0]).convert("RGB")
+        spec = _camera_for_source(kind, camera_data, index)
+        cloud = _load_scene_cloud(context_dir, context, kind, index)
+    if source.size != (spec.width, spec.height):
+        raise ValueError(
+            f"source RGB is {source.width}x{source.height}, but calibrated camera is "
+            f"{spec.width}x{spec.height}"
+        )
+    return source, spec, cloud
+
+
+def _render_observation_views(
     context_dir: Path,
     pose: Pose,
     output: Path,
     mode: ObservationMode | str,
-    title: str,
-    kind: str,
-    native_focus: bool = False,
-    use_source_material: bool = False,
+    frame_index: int,
 ) -> list[Path]:
     mode = ObservationMode(mode)
     context = json.loads((context_dir / "context.json").read_text())
-    mesh_path = context_dir / context["mesh_path"]
-    if mode is ObservationMode.SIX_AXIS:
-        canvas = _render_six_axis(context_dir, mesh_path, pose, title)
-        output.parent.mkdir(parents=True, exist_ok=True)
-        canvas.save(output, optimize=True)
-        return [output]
-
-    if kind == "foundationpose":
-        camera_data = json.loads((context_dir / "camera.json").read_text())
-        source = Image.open(context_dir / context["rgb_paths"][0]).convert("RGB")
-        width, height = source.size
-        view_w, view_h = (
-            (width, height) if native_focus else _fit_viewport(width, height)
-        )
-        spec = _foundation_camera(camera_data).scaled(view_w, view_h)
-        current = _mesh_overlay(
-            source,
-            mesh_path,
-            pose,
-            spec,
-            _observation_depth(context_dir, kind),
-            _load_cloud(context_dir),
-            use_source_material=use_source_material,
-        )
-        if native_focus:
-            return _save_native_scene_set(
-                output, source, current, context["target_bbox_xyxy"]
-            )
-        panels = [
-            _reference_panel(
-                context_dir / context["rgb_paths"][0],
-                context.get("target_bbox_xyxy"),
-                "REFERENCE RGB",
-            ),
-            _panel(current, "CURRENT MESH / GREEN = OCCLUDED"),
-        ]
-        _save_panels(output, title, panels, columns=2)
-        return [output]
-
-    if kind == "ca1m_objects":
-        camera_data = json.loads((context_dir / "camera.json").read_text())["views"]
-        panels = []
-        cloud = _load_cloud(context_dir)
-        for index, view in enumerate(camera_data):
-            source_path = context_dir / context["rgb_paths"][index]
-            source = Image.open(source_path).convert("RGB")
-            view_w, view_h = _fit_viewport(*source.size)
-            spec = _ca1m_camera(view).scaled(view_w, view_h)
-            current = _mesh_overlay(
-                source,
-                mesh_path,
-                pose,
-                spec,
-                _observation_depth(context_dir, kind, index),
-                cloud,
-                use_source_material=use_source_material,
-            )
-            panels.append(_panel(current, f"CAMERA {index} / CURRENT MESH"))
-        _save_panels(output, "GizmoAct / FOUR CALIBRATED RGB-D VIEWS", panels, columns=2)
-        return [output]
-
+    kind = context["source"]
+    camera_data = json.loads((context_dir / context.get("camera_path", "camera.json")).read_text())
     if kind == "populated_3d_front":
-        background = Image.open(context_dir / context["rgb_paths"][0]).convert("RGB")
-        width, height = background.size
-        viewport_w, viewport_h = (
-            (width, height) if native_focus else _fit_viewport(width, height)
-        )
-        bbox = np.asarray(context["target_bbox_xyxy"], dtype=np.float64)
-        center_px = np.array([(bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2])
-        box_wh = np.maximum([bbox[2] - bbox[0], bbox[3] - bbox[1]], 8.0)
-        view_x = np.array([0.94, -0.34, 0.0], dtype=np.float64)
-        view_y = np.array([0.18, 0.49, -0.85], dtype=np.float64)
-        right = view_x / np.linalg.norm(view_x)
-        up = view_y - right * float(right @ view_y)
-        up /= np.linalg.norm(up)
-        back = np.cross(right, up)
-        back /= np.linalg.norm(back)
-        target = Pose(
-            np.asarray(context["target_pose"]["position_m"], dtype=np.float64),
-            np.asarray(context["target_pose"]["rotation_object_to_world"], dtype=np.float64),
-            np.asarray(context["target_pose"]["size_m"], dtype=np.float64),
-        )
-        scale = min(box_wh[0] / max(target.size.max(), 1e-6), box_wh[1] / max(target.size.max(), 1e-6)) * 1.25
-        scale *= viewport_w / width
-        camera_to_world = np.eye(4, dtype=np.float64)
-        camera_to_world[:3, :3] = np.column_stack((right, up, back))
-        camera_to_world[:3, 3] = target.position + back * 10.0
-        spec = CameraSpec(
-            camera_to_world_gl=camera_to_world,
-            width=viewport_w,
-            height=viewport_h,
-            projection="orthographic",
-            xmag=viewport_w / (2.0 * scale),
-            ymag=viewport_h / (2.0 * scale),
-        )
-        # Keep the released rectangle center while using the deterministic
-        # oblique projection documented for MesaTask's missing camera data.
-        base_center = center_px * (viewport_w / width)
-        spec = CameraSpec(
-            spec.camera_to_world_gl,
-            spec.width,
-            spec.height,
-            spec.projection,
-            xmag=spec.xmag,
-            ymag=spec.ymag,
-        )
-        # Shift the camera so the target projects onto the original target box
-        # center rather than the center of the square render viewport.
-        desired_center = np.array([base_center[0], base_center[1]])
-        actual_center, _ = spec.project(target.position[None, :])
-        shift = desired_center - actual_center[0]
-        if np.isfinite(shift).all() and np.linalg.norm(shift) > 0.5:
-            matrix = spec.camera_to_world_gl.copy()
-            matrix[:3, 3] -= matrix[:3, 0] * shift[0] / scale
-            matrix[:3, 3] += matrix[:3, 1] * shift[1] / scale
-            spec = CameraSpec(
-                matrix, spec.width, spec.height, spec.projection,
-                xmag=spec.xmag, ymag=spec.ymag,
-            )
-        current = _mesh_overlay(
-            background, mesh_path, pose, spec, None, _load_cloud(context_dir),
-            use_source_material=use_source_material,
-        )
-        if native_focus:
-            return _save_native_scene_set(
-                output, background, current, context["target_bbox_xyxy"]
-            )
-        panels = [
-            _reference_panel(
-                context_dir / context["rgb_paths"][0],
-                context.get("target_bbox_xyxy"),
-                "REFERENCE RGB",
-            ),
-            _panel(current, "CURRENT MESH + SCENE POINT CLOUD"),
-        ]
-        _save_panels(output, "GizmoAct / APPROXIMATE MESA DISPLAY CAMERA", panels, columns=2)
-        return [output]
+        _validate_populated_scene(context_dir, context, camera_data)
+    mesh_path = context_dir / context["mesh_path"]
+    source, camera, cloud = _selected_frame(
+        context_dir, context, camera_data, kind, frame_index
+    )
+    source_rgb = np.asarray(source, dtype=np.uint8)
+    colored_points, point_colors = _project_frontmost_cloud(cloud, camera, source_rgb)
 
-    raise NotImplementedError(f"no renderer for source type {kind!r}")
+    mesh_rgb, mesh_depth = _render_mesh(mesh_path, pose, camera)
+    overlay = _blend_mesh(source_rgb, mesh_rgb, mesh_depth)
+    overlay = _draw_gizmo(overlay, camera, pose)
+    point_view, cloud_depth = _rasterize_cloud(
+        colored_points, point_colors, camera, POINT_BACKGROUND
+    )
+    point_view = _blend_mesh(
+        point_view,
+        mesh_rgb,
+        mesh_depth,
+        cloud_depth=cloud_depth,
+        show_occlusion=True,
+    )
+    point_view = _draw_gizmo(point_view, camera, pose)
+
+    paths = [output, _derive_path(output, "overlay"), _derive_path(output, "pointcloud")]
+    _save_rgb(paths[0], source_rgb)
+    _save_rgb(paths[1], overlay)
+    _save_rgb(paths[2], point_view)
+
+    if mode is ObservationMode.SIX_AXIS:
+        for axis, axis_name in enumerate(("x", "y", "z")):
+            for sign, sign_name in ((1, "pos"), (-1, "neg")):
+                ortho = _axis_camera(pose, axis, sign, ORTHO_SIZE)
+                ortho_view, ortho_cloud_depth = _rasterize_cloud(
+                    colored_points, point_colors, ortho, POINT_BACKGROUND
+                )
+                ortho_mesh_rgb, ortho_mesh_depth = _render_mesh(mesh_path, pose, ortho)
+                ortho_view = _blend_mesh(
+                    ortho_view,
+                    ortho_mesh_rgb,
+                    ortho_mesh_depth,
+                    cloud_depth=ortho_cloud_depth,
+                    show_occlusion=True,
+                )
+                ortho_view = _draw_gizmo(ortho_view, ortho, pose)
+                path = _derive_path(output, f"local_{axis_name}_{sign_name}")
+                _save_rgb(path, ortho_view)
+                paths.append(path)
+    return paths
 
 
 def render_native_focus_observation(
@@ -691,20 +602,12 @@ def render_native_focus_observation(
     pose: Pose,
     output: Path,
     mode: ObservationMode | str = ObservationMode.SCENE,
-    use_source_material: bool = False,
+    use_source_material: bool = True,
+    frame_index: int = 0,
 ) -> list[Path]:
-    """Render a scene observation; optionally preserve the source GLB material for display."""
-    context = json.loads((context_dir / "context.json").read_text())
-    return _save_observation(
-        context_dir,
-        pose,
-        output,
-        mode,
-        "Adjust the highlighted target mesh",
-        context["source"],
-        native_focus=True,
-        use_source_material=use_source_material,
-    )
+    """Write full-resolution raw, textured overlay and RGB-colored point-cloud views."""
+    del use_source_material  # All corrected overlays preserve the source asset material.
+    return _render_observation_views(context_dir, pose, output, mode, frame_index)
 
 
 def render_foundation_observation(
@@ -713,9 +616,10 @@ def render_foundation_observation(
     output: Path,
     title: str = "Adjust the highlighted target mesh",
     mode: ObservationMode | str = ObservationMode.SCENE,
-) -> None:
-    """Render the calibrated FoundationPose scene and the full transformed mesh surface."""
-    _save_observation(context_dir, pose, output, mode, title, "foundationpose")
+    frame_index: int = 0,
+) -> list[Path]:
+    del title
+    return _render_observation_views(context_dir, pose, output, mode, frame_index)
 
 
 def render_mesatask_observation(
@@ -724,9 +628,10 @@ def render_mesatask_observation(
     output: Path,
     title: str = "Adjust the highlighted target mesh",
     mode: ObservationMode | str = ObservationMode.SCENE,
-) -> None:
-    """Render MesaTask with its documented fixed approximate display projection."""
-    _save_observation(context_dir, pose, output, mode, title, "populated_3d_front")
+    frame_index: int = 0,
+) -> list[Path]:
+    del title
+    return _render_observation_views(context_dir, pose, output, mode, frame_index)
 
 
 def render_ca1m_observation(
@@ -735,6 +640,7 @@ def render_ca1m_observation(
     output: Path,
     title: str = "Adjust the highlighted target mesh",
     mode: ObservationMode | str = ObservationMode.SCENE,
-) -> None:
-    """Render the current mesh surface in all calibrated CA-1M RGB-D views."""
-    _save_observation(context_dir, pose, output, mode, title, "ca1m_objects")
+    frame_index: int = 0,
+) -> list[Path]:
+    del title
+    return _render_observation_views(context_dir, pose, output, mode, frame_index)
